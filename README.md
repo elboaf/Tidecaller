@@ -1,23 +1,49 @@
 # Tidecaller
 
-**Version:** 0.1  
+**Version:** 0.2  
 **Author:** Rel  
 **Client:** Turtle WoW 1.12 / SuperWoW
 
-Shaman healing addon with aggro-aware target selection, position-based Chain Heal scoring, and pressure-driven LHW downranking. Built for multibox and small group play.
+Shaman healing addon with aggro-aware target selection, position-based Chain Heal scoring, and pressure-driven LHW rank selection. Built for multibox and small group play, with raid support via downrank aggressiveness controls.
+
+---
+
+## Changelog
+
+### 0.2
+- **Removed Solo/Raid mode split** — unified into a single healing decision tree that works correctly in both contexts. `/tcsolo` and `/tcraid` removed.
+- **Chain Heal minimum cluster requirement raised to 3** — Chain Heal now requires at least 3 injured players in range. At 2 targets, two LHW casts are more time-efficient; at 3 the math firmly favours Chain Heal.
+- **Chain Heal always R1** — marginal mana cost of R2/R3 upgrades (~3.1 hp/mana) is worse than LHW R6. R1 at 6.06 hp/mana across 3 targets is the most efficient cast in the kit.
+- **Full LHW rank ladder (R1–R6)** — replaced the binary R2/R6 system. `PickLHWRank` walks R1→R6 and selects the lowest rank whose effective heal covers the target's required threshold. Mana gate steps down if a rank is unaffordable, flooring at R1.
+- **Crisis path now rank-selects** — LHW_CRISIS no longer hardcodes R6. Uses `CRISIS_AGGRESSIVENESS` to scale the required threshold and picks the lowest rank that covers it. No mana gate in crisis.
+- **Downrank aggressiveness system** — two new settings scale the required healing threshold as a fraction of the deficit:
+  - `DOWNRANK_AGGRESSIVENESS` (0.0–1.0) — applied to all normal LHW casts
+  - `CRISIS_AGGRESSIVENESS` (0.0–1.0) — applied to LHW_CRISIS casts only
+  - At 1.0 (default) behaviour is unchanged. At 0.5 the addon targets 50% of the deficit (× tank factor), allowing other healers to cover the rest.
+- **Downrank GUI** — `/tcdr` opens a minimal draggable window with two sliders for live adjustment of both aggressiveness values. Changes apply immediately and persist across sessions.
+- **Own healing power scanner** — replaced BonusScanner/BCS dependency. Tooltip-scans all 19 equipment slots, weapon oils, and active buffs. Correctly buckets `+damage and healing` and `+healing only` separately. Cache invalidates on inventory or aura change.
+- **Corrected spell coefficients and base heals** — all LHW and Chain Heal base heals updated to match in-game tooltip values on Turtle WoW. Chain Heal coefficient empirically derived as 0.6500.
+- **Corrected mana costs** — LHW and Chain Heal mana costs updated to in-game confirmed values.
+- **Follow fix** — `/tcl` now resolves the follow target to a unitid (`party1`, `raid1`, etc.) via `UnitGUID` matching and calls `FollowUnit()` directly, bypassing Turtle WoW's fuzzy name matching.
+- **Expanded log format** — log now includes `healingPower`, `missingHP`, `required`, `effectiveHeal`, `aggressiveness`, and `isTank` per cast. The `mode` column has been removed.
+- **Fixed log timestamps** — `LogTimestamp()` now uses `GetGameTime()` for h/m/s and `GetTime()` fraction for centiseconds.
+- **`/tcstatus` command** — shows healing power breakdown, effective heal for all 6 LHW ranks, and per-member rank decisions at current HP.
 
 ---
 
 ## Features
 
-- **Two healing modes** — Solo and Raid, each with distinct spell priority logic
-- **Pressure scoring** — combines HP deficit, live aggro status, and aggro history into a single score per unit to drive spell rank and target selection
-- **Position-aware Chain Heal** — uses SuperWoW `UnitPosition` to score clusters of nearby hurt players; picks the primary target that maximises total healing delivered across all bounces
-- **LHW downranking** — automatically steps down from R6 to R2 based on pressure score and mana, avoiding waste on low-priority targets
-- **Banzai-1.0 aggro integration** — tracks who is tanking in real time; tank-like units receive priority healing and different rank thresholds
-- **QuickHeal avoidance** — optional mode that skips the lowest-HP target on the assumption other healers are already covering them
-- **Follow-by-unitid** — follow logic resolves your target to a party/raid unitid (`party1`, `raid3`, etc.) and calls `FollowUnit()` directly, bypassing Turtle WoW's fuzzy name matching
-- **Heal decision logging** — structured per-cast log with timestamp, unit, HP%, pressure, cluster score, mode, and spell rank; exportable to `TidecallerLog.txt` via SuperWoW `ExportFile`
+- **Unified healing logic** — single priority tree covering both small group and raid play
+- **Pressure scoring** — combines HP deficit, live aggro status, and aggro history into a per-unit score driving target selection and spell choice
+- **Position-aware Chain Heal** — uses SuperWoW `UnitPosition` to score clusters of nearby hurt players; picks the primary target that maximises total healing across all bounces
+- **LHW rank selection** — picks the lowest rank covering the required threshold (deficit × tank factor × aggressiveness). Mana gate steps down if unaffordable
+- **Crisis path** — when a tank-like unit reaches pressure ≥ 0.80, LHW fires immediately at the lowest rank covering the crisis threshold. No mana gate
+- **Downrank aggressiveness** — two independent 0.0–1.0 sliders (normal and crisis) for tuning how aggressively the addon commits to high ranks. Designed for raids where other healers share the load
+- **Banzai-1.0 aggro integration** — tracks tanking in real time; tank-like units receive priority healing and a 1.20× overheal buffer on required thresholds
+- **Own healing power scanner** — no external dependency; correct `+damage and healing` bucketing
+- **QuickHeal avoidance** — optional mode that skips the lowest-pressure target
+- **Follow-by-unitid** — resolves target to a party/raid unitid and calls `FollowUnit()` directly
+- **Heal decision logging** — structured per-cast log with all relevant state; exportable via SuperWoW `ExportFile`
 
 ---
 
@@ -29,14 +55,13 @@ Shaman healing addon with aggro-aware target selection, position-based Chain Hea
 | **AceLibrary** | Bundled in `libs\` |
 | **AceEvent-2.0** | Bundled in `libs\` |
 | **RosterLib-2.0** | Bundled in `libs\` |
-| **Banzai-1.0** | Bundled in `libs\` — aggro features are disabled gracefully if missing |
+| **Banzai-1.0** | Bundled in `libs\` — aggro features disabled gracefully if missing |
 
 ---
 
 ## Installation
 
-1. Copy the `Tidecaller` folder into your `Interface\AddOns\` directory.
-2. The folder structure should look like this:
+1. Copy the `Tidecaller` folder into your `Interface\AddOns\` directory:
 
 ```
 Interface/
@@ -51,7 +76,7 @@ Interface/
       Tidecaller.toc
 ```
 
-3. Enable the addon at the character select screen and log in.
+2. Enable the addon at the character select screen and log in.
 
 ---
 
@@ -59,16 +84,16 @@ Interface/
 
 | Command | Description |
 |---|---|
-| `/tcheal` | Cast a heal based on the current decision logic |
-| `/tcsolo` | Switch to **Solo mode** (pressure-driven, LHW primary) |
-| `/tcraid` | Switch to **Raid mode** (Chain Heal primary) |
-| `/tcqh` | Toggle QuickHeal avoidance (skip the lowest HP target) |
+| `/tcheal` | Cast a heal based on current decision logic |
+| `/tcqh` | Toggle QuickHeal avoidance |
 | `/tcfollow` | Toggle follow on/off |
-| `/tcl` | Set follow target to your current target |
+| `/tcl` | Set follow target to current target (saves unitid) |
+| `/tcdr` | Toggle downrank aggressiveness GUI |
 | `/tclog` | Toggle heal decision logging on/off |
-| `/tcexport` | Write the log buffer to `TidecallerLog.txt` |
-| `/tclogclear` | Clear the log buffer without writing |
-| `/tclogstat` | Show current log buffer status |
+| `/tcexport` | Write log buffer to `TidecallerLog.txt` |
+| `/tclogclear` | Clear log buffer without writing |
+| `/tclogstat` | Show log buffer status |
+| `/tcstatus` | Show healing power, LHW rank effective heals, and per-member rank decisions |
 | `/tcdebug` | Toggle debug output |
 | `/tcbanzai` | Diagnose Banzai-1.0 integration |
 | `/tc` | Show command help |
@@ -77,88 +102,97 @@ Interface/
 
 ## Healing Logic
 
-### Solo Mode (`/tcsolo`)
+### Decision Priority (per `/tcheal` press)
 
-Prioritises tank survival. Spell priority per `/tcheal` press:
-
-1. **Tank in crisis** (pressure ≥ 0.80) → LHW immediately, no cluster check
-2. **Tank with nearby hurt players** → Chain Heal ranked by cluster score
-3. **Tank isolated** → LHW ranked by pressure
-4. **No tank, cluster exists** → Chain Heal if enough nearby hurt players (`CHAIN_HEAL_MIN`)
+1. **Tank in crisis** (pressure ≥ 0.80) → LHW at rank per `CRISIS_AGGRESSIVENESS`, no mana gate
+2. **Tank with 2+ nearby hurt players** → Chain Heal R1 on the tank
+3. **Tank isolated or cluster too small** → LHW at rank per `PickLHWRank`
+4. **No tank, 3+ injured in cluster** → Chain Heal R1 on best cluster target
 5. **Fallback** → LHW on highest-pressure unit
-
-### Raid Mode (`/tcraid`)
-
-Chain Heal primary. Spell priority per `/tcheal` press:
-
-1. **Tank with nearby hurt players** → Chain Heal ranked by cluster score
-2. **Tank isolated** → LHW on tank
-3. **No tank** → Chain Heal on best cluster target
-4. **Fallback** → LHW on highest-pressure unit
 
 ### Pressure Score
 
-Each unit's pressure score (0.0–1.0) is composed of:
+Each unit's pressure score (0.0–1.0):
 
-| Component | Max contribution |
+| Component | Contribution |
 |---|---|
-| HP deficit | 0.50 |
+| HP deficit | up to 0.50 |
 | Live aggro (currently tanking) | +0.25 |
 | Aggro history (rolling count) | 0.0–0.25 |
 
-Units below 20% HP are given a minimum pressure of 0.75 regardless of aggro status.
+Units below 20% HP receive a minimum pressure of 0.75 regardless of aggro.
 
-### LHW Rank Selection
+### LHW Rank Selection (`PickLHWRank`)
 
-- **Tank-like unit:** R6 if pressure ≥ `LHW_PRESSURE_FLOOR` (default 0.55), otherwise R2
-- **Non-tank:** R6 if below 40% HP, otherwise R2
-- **Mana gate:** steps down toward R2 if current mana cannot afford the chosen rank
+```
+required = missingHP × tankFactor × DOWNRANK_AGGRESSIVENESS
+```
 
-### Chain Heal Cluster Scoring
+- `tankFactor` = `TANK_OVERHEAL_FACTOR` (1.20) for tank-like units, 1.0 otherwise
+- Walk R1→R6, pick the first rank where `effectiveHeal >= required`
+- Mana gate: step down until affordable, floor at R1
 
-For each candidate primary target, the cluster score sums:
+Effective heal per rank at 769 +healing (example):
 
-- The primary target's HP deficit
-- The HP deficit of every other hurt player within `CHAIN_HEAL_RANGE` yards (default 12)
-- A small aggro bonus for any unit in the cluster that is tank-like
-
-The candidate with the highest cluster score is chosen as the Chain Heal primary.
-
----
-
-## Follow
-
-`/tcl` saves the **unitid** (`party1`, `party2`, `raid1`, etc.) of your current target rather than their name, then calls `FollowUnit()` directly. This avoids Turtle WoW's fuzzy name matching, which can cause `/followbyname` to resolve incorrectly when character names are similar (e.g. `Rels` vs `Relsh`).
-
-`/tcheal` will automatically follow when called with nobody below the heal threshold and follow is enabled.
-
-> **Note:** Unitids are not persistent across sessions. Re-run `/tcl` after reforming a group or relogging.
-
----
-
-## Configuration
-
-Settings are saved in `TidecallerDB` and persist across sessions. They can be adjusted directly in the saved variables file or via the slash commands above.
-
-| Variable | Default | Description |
+| Rank | Mana | Effective |
 |---|---|---|
-| `RAID_MODE` | `false` | `false` = Solo mode, `true` = Raid mode |
-| `HEAL_THRESHOLD` | `90` | Only consider units below this HP% as heal candidates |
-| `CHAIN_HEAL_MIN` | `2` | Minimum hurt players in cluster to prefer Chain Heal (Solo mode) |
-| `CHAIN_HEAL_RANGE` | `12` | Yard radius for Chain Heal bounce scoring |
-| `LHW_PRESSURE_FLOOR` | `0.55` | Pressure threshold separating R2 and R6 LHW for tanks |
-| `QUICKHEAL_AVOID` | `false` | Skip the lowest HP target to avoid overlapping with QuickHeal users |
-| `FOLLOW_ENABLED` | `false` | Whether to follow after `/tcheal` finds no heal candidates |
-| `FOLLOW_TARGET_UNIT` | `nil` | Unitid of the follow target (set via `/tcl`) |
+| R1 | 99 | ~512 |
+| R2 | 137 | ~604 |
+| R3 | 175 | ~701 |
+| R4 | 223 | ~831 |
+| R5 | 289 | ~1016 |
+| R6 | 361 | ~1210 |
+
+### Chain Heal
+
+Always R1. Efficiency at 769 +healing across 3 targets: **6.06 hp/mana** — the most efficient cast in the kit. Fires only when `CHAIN_HEAL_MIN` (default 3) or more injured players are within `CHAIN_HEAL_RANGE` yards of the primary target.
+
+### Downrank Aggressiveness
+
+Two independent settings, adjustable live via `/tcdr`:
+
+| Setting | Applies to |
+|---|---|
+| `DOWNRANK_AGGRESSIVENESS` | All normal LHW casts |
+| `CRISIS_AGGRESSIVENESS` | LHW_CRISIS casts only |
+
+At 1.0: picks the minimum rank needed to cover the full required threshold. At 0.5: targets 50% of the required threshold, leaving the rest for other healers. Note: the tank overheal factor (1.20) is applied before aggressiveness, so 0.5 on a tank effectively covers ~60% of raw missing HP.
 
 ---
 
 ## Logging
 
-`/tclog` starts recording a structured entry for every heal cast. Each entry contains:
+`/tclog` records a structured entry per cast:
 
 ```
-timestamp | unit | hp% | pressure | clusterScore | mode | liveAggro | aggroScore | action | spellRank
+ts | unit | hp% | pressure | clusterScore | liveAggro | aggroScore | action | spellRank | healingPower | missingHP | required | effectiveHeal | aggressiveness | isTank
 ```
 
-`/tcexport` writes the buffer to `TidecallerLog.txt` (requires SuperWoW). `/tclog` a second time stops logging and also flushes the buffer. The buffer holds up to 500 entries and drops the oldest when full.
+`/tcexport` writes the buffer to `TidecallerLog.txt` (requires SuperWoW). Buffer holds up to 500 entries, drops oldest when full.
+
+---
+
+## Configuration
+
+All settings persist in `TidecallerDB` across sessions.
+
+| Variable | Default | Description |
+|---|---|---|
+| `HEAL_THRESHOLD` | `90` | Only consider units below this HP% as heal candidates |
+| `CHAIN_HEAL_MIN` | `3` | Minimum injured players in cluster to use Chain Heal |
+| `CHAIN_HEAL_RANGE` | `12` | Yard radius for Chain Heal cluster scoring |
+| `TANK_OVERHEAL_FACTOR` | `1.20` | Required threshold multiplier for tank-like targets |
+| `DOWNRANK_AGGRESSIVENESS` | `1.0` | Fraction of required threshold to target (normal casts) |
+| `CRISIS_AGGRESSIVENESS` | `1.0` | Fraction of required threshold to target (crisis casts) |
+| `LHW_PRESSURE_FLOOR` | `0.55` | Pressure gate for QuickHeal avoidance logic |
+| `QUICKHEAL_AVOID` | `false` | Skip lowest-pressure target to avoid overlapping with QuickHeal users |
+| `FOLLOW_ENABLED` | `false` | Follow after `/tcheal` finds no candidates |
+| `FOLLOW_TARGET_UNIT` | `nil` | Unitid of follow target (set via `/tcl`) |
+
+---
+
+## Follow
+
+`/tcl` saves the **unitid** (`party1`, `party2`, `raid1`, etc.) of your current target and calls `FollowUnit()` directly. This avoids Turtle WoW's fuzzy `/followbyname` matching, which incorrectly resolves similar names (e.g. `Rels` vs `Relsh`).
+
+> **Note:** Unitids are not persistent across sessions. Re-run `/tcl` after reforming a group or relogging.
