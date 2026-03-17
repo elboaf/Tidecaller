@@ -15,11 +15,13 @@ Client: TurtleWoW 1.12 / SuperWoW -- Lua 5.0 compatible, no goto statements
 
 TidecallerDB = TidecallerDB or {
     DEBUG_MODE          = false,
-    RAID_MODE           = false,   -- false = Solo mode, true = Raid mode
     HEAL_THRESHOLD      = 90,      -- Only consider units below this hp%
-    CHAIN_HEAL_MIN      = 2,       -- Min hurt players in cluster to prefer Chain Heal (solo mode)
+    CHAIN_HEAL_MIN      = 2,       -- Min hurt players in cluster to prefer Chain Heal
     CHAIN_HEAL_RANGE    = 12,      -- Yards for Chain Heal bounce scoring
-    LHW_PRESSURE_FLOOR  = 0.55,    -- Below this pressure use LHW R2, above use LHW R6
+    LHW_PRESSURE_FLOOR  = 0.55,    -- Urgency gate for QuickHeal avoidance; below this pressure = skippable
+    TANK_OVERHEAL_FACTOR = 1.20,   -- Chosen rank must cover this multiple of a tank's deficit
+    DOWNRANK_AGGRESSIVENESS = 1.0, -- 0.0-1.0: scales required threshold in PickLHWRank (1.0 = full)
+    CRISIS_AGGRESSIVENESS   = 1.0, -- 0.0-1.0: scales required threshold in crisis path (1.0 = full)
     QUICKHEAL_AVOID     = false,   -- Skip lowest HP target (assume QuickHeal users cover them)
     FOLLOW_ENABLED      = false,
     FOLLOW_TARGET_NAME  = nil,   -- kept for backward compat; runtime uses FOLLOW_TARGET_UNIT
@@ -54,35 +56,31 @@ local logEntryCount   = 0
 
 -------------------------------------------------------------------------------
 -- Spell ID Tables
--- Chain Heal:         R1=1064  R2=10622  R3=10623
--- Lesser Healing Wave: R2=8005  R6=25420
+-- Chain Heal:         R1=1064  R2=10622  R3=10623  (only R1 used — best mana efficiency)
+-- Lesser Healing Wave: R1=516  R2=8005  R3=8006  R4=10466  R5=10467  R6=25420
 -------------------------------------------------------------------------------
 
-local SPELL_ID = {
-    ["Chain Heal"] = {
-        1064,   -- Rank 1
-        10622,  -- Rank 2
-        10623,  -- Rank 3
-    },
-    ["Lesser Healing Wave"] = {
-        516,    -- Rank 1
-        8005,   -- Rank 2
-        8006,   -- Rank 3
-        10466,  -- Rank 4
-        10467,  -- Rank 5
-        25420,  -- Rank 6
-    },
-}
+-- Spell IDs for reference (not used at runtime; CastSpellByName handles lookup):
+--   Chain Heal R1: 1064
+--   LHW R1:516  R2:8005  R3:8006  R4:10466  R5:10467  R6:25420
 
--- LHW mana costs (approximate, untalented)
-local LHW_MANA = {
-    50,   -- R1
-    105,  -- R2
-    185,  -- R3
-    250,  -- R4
-    310,  -- R5
-    395,  -- R6
-}
+-- LHW mana costs (in-game confirmed)
+local LHW_MANA = { 99, 137, 175, 223, 289, 361 }
+
+-- LHW average base heals (midpoint of in-game tooltip ranges, untalented at 60)
+-- R1: 170-195 → 182   R2: 257-292 → 274   R3: 349-394 → 371
+-- R4: 473-529 → 501   R5: 649-723 → 686   R6: 832-928 → 880
+local LHW_BASE = { 182, 274, 371, 501, 686, 880 }
+
+-- +healing coefficient for LHW (1.5s cast time; coefficient = 1.5/3.5)
+-- No downranking penalty on Turtle WoW — confirmed empirically.
+local LHW_HEAL_COEFF = 0.4286
+
+-- Chain Heal R1 is always used — best mana efficiency (6.06 hp/mana across 3 targets).
+-- R2/R3 marginal upgrade cost (~3.1 hp/mana) is worse than LHW R6 (3.35 hp/mana).
+-- R1: 332-381 base → midpoint 356, ~856 effective at 769 +healing
+local CH_BASE_R1    = 356
+local CH_HEAL_COEFF = 0.6500  -- empirically derived (theoretical 2.5/3.5=0.7143 overshoots R1)
 
 -------------------------------------------------------------------------------
 -- Utility
@@ -96,6 +94,208 @@ local function Debug(msg)
     if settings.DEBUG_MODE then
         DEFAULT_CHAT_FRAME:AddMessage("|cff88ffffTidecaller:|r " .. msg)
     end
+end
+
+-------------------------------------------------------------------------------
+-- Healing Power Scanner
+--
+-- Self-contained; no dependency on BonusScanner or BetterCharacterStats.
+-- Scans all 19 equipment slots and active buffs for:
+--   damage_and_healing  (+spell damage and healing items, weapon oils)
+--   healing_only        (+healing only items, healing buffs)
+-- Total healing power = damage_and_healing + healing_only
+--
+-- Cache is invalidated on UNIT_INVENTORY_CHANGED and PLAYER_AURAS_CHANGED.
+-- Actual scan is deferred until GetEffectiveHealingPower() is called so we
+-- never do tooltip work inside an event handler.
+-------------------------------------------------------------------------------
+
+local TCL_Tooltip = CreateFrame("GameTooltip", "TidecallerScanTooltip", nil, "GameTooltipTemplate")
+TCL_Tooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
+local TCL_PREFIX = "TidecallerScanTooltip"
+
+local healCache = {
+    damage_and_healing = 0,
+    healing_only       = 0,
+    dirty              = true,   -- start dirty so first call triggers a scan
+}
+
+-- Register cache invalidation events on the existing eventFrame (defined later,
+-- but event registration is deferred to ADDON_LOADED anyway, so this is fine).
+-- We use a separate small frame here to keep it self-contained.
+local healCacheFrame = CreateFrame("Frame")
+healCacheFrame:RegisterEvent("UNIT_INVENTORY_CHANGED")
+healCacheFrame:RegisterEvent("PLAYER_AURAS_CHANGED")
+healCacheFrame:SetScript("OnEvent", function()
+    if event == "UNIT_INVENTORY_CHANGED" and arg1 ~= "player" then return end
+    healCache.dirty = true
+end)
+
+local function ScanHealingPower()
+    local dah = 0   -- damage and healing
+    local ho  = 0   -- healing only
+
+    -- Track which set bonuses we've already counted to avoid adding them
+    -- once per equipped piece (same deduplication BCS uses)
+    local countedSets = {}
+
+    -- ---- Gear scan ----
+    for slot = 1, 19 do
+        local itemLink = GetInventoryItemLink("player", slot)
+        if itemLink then
+            local _, _, eqLink = string.find(itemLink, "(item:%d+:%d+:%d+:%d+)")
+            if eqLink then
+                TCL_Tooltip:ClearLines()
+                TCL_Tooltip:SetHyperlink(eqLink)
+                local setName = nil
+                for line = 1, TCL_Tooltip:NumLines() do
+                    local text = _G[TCL_PREFIX .. "TextLeft" .. line]:GetText()
+                    if text then
+                        local _, _, v
+
+                        -- +damage and healing (5 tooltip variants)
+                        _, _, v = string.find(text, "Increases damage and healing done by magical spells and effects by up to (%d+)%.")
+                        if v then dah = dah + tonumber(v) end
+
+                        _, _, v = string.find(text, "Spell Damage %+(%d+)")
+                        if v then dah = dah + tonumber(v) end
+
+                        _, _, v = string.find(text, "^%+(%d+) Spell Damage and Healing")
+                        if v then dah = dah + tonumber(v) end
+
+                        _, _, v = string.find(text, "^%+(%d+) Damage and Healing Spells")
+                        if v then dah = dah + tonumber(v) end
+
+                        _, _, v = string.find(text, "^%+(%d+) Spell Power")
+                        if v then dah = dah + tonumber(v) end
+
+                        -- +healing only (5 tooltip variants)
+                        _, _, v = string.find(text, "Increases healing done by spells and effects by up to (%d+)%.")
+                        if v then ho = ho + tonumber(v) end
+
+                        _, _, v = string.find(text, "Healing Spells %+(%d+)")
+                        if v then ho = ho + tonumber(v) end
+
+                        _, _, v = string.find(text, "^%+(%d+) Healing Spells")
+                        if v then ho = ho + tonumber(v) end
+
+                        _, _, v = string.find(text, "Healing %+(%d+)")
+                        if v then ho = ho + tonumber(v) end
+
+                        -- Atiesh healing portion
+                        _, _, v = string.find(text, "Increases your spell damage by up to %d+ and your healing by up to (%d+)%.")
+                        if v then ho = ho + tonumber(v) end
+
+                        -- Set name line e.g. "Regalia of the Archmage (2/8)"
+                        _, _, v = string.find(text, "^(.+) %(%d/%d%)$")
+                        if v then setName = v end
+
+                        -- Set bonuses: only count each set once across all slots
+                        if setName and not countedSets[setName] then
+                            _, _, v = string.find(text, "^Set: Increases damage and healing done by magical spells and effects by up to (%d+)%.")
+                            if v then
+                                dah = dah + tonumber(v)
+                                countedSets[setName] = true
+                            end
+
+                            _, _, v = string.find(text, "^Set: Increases healing done by spells and effects by up to (%d+)%.")
+                            if v then
+                                ho = ho + tonumber(v)
+                                countedSets[setName] = true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Weapon oils (must use SetInventoryItem, not SetHyperlink)
+    if TCL_Tooltip:SetInventoryItem("player", 16) then
+        for line = 1, TCL_Tooltip:NumLines() do
+            local text = _G[TCL_PREFIX .. "TextLeft" .. line]:GetText()
+            if text then
+                if string.find(text, "^Brilliant Wizard Oil") then
+                    dah = dah + 36; break
+                elseif string.find(text, "^Lesser Wizard Oil") then
+                    dah = dah + 16; break
+                elseif string.find(text, "^Minor Wizard Oil") then
+                    dah = dah + 8;  break
+                elseif string.find(text, "^Wizard Oil") then
+                    dah = dah + 24; break
+                elseif string.find(text, "^Brilliant Mana Oil") then
+                    ho = ho + 25;   break
+                end
+            end
+        end
+    end
+
+    -- ---- Aura (buff) scan ----
+    for i = 1, 32 do
+        local texture = UnitBuff("player", i)
+        if not texture then break end
+
+        -- Read buff tooltip lines
+        TCL_Tooltip:ClearLines()
+        TCL_Tooltip:SetUnitBuff("player", i)
+        for line = 1, TCL_Tooltip:NumLines() do
+            local text = _G[TCL_PREFIX .. "TextLeft" .. line]:GetText()
+            if text then
+                local _, _, v
+
+                -- +damage and healing auras (Flask of Supreme Power, etc.)
+                _, _, v = string.find(text, "Increases damage and healing done by magical spells and effects by up to (%d+)%.")
+                if v then dah = dah + tonumber(v) end
+
+                -- +healing auras (Sayge's Fortune, Songflower, etc.)
+                _, _, v = string.find(text, "Healing done by magical spells is increased by up to (%d+)%.")
+                if v then ho = ho + tonumber(v) end
+
+                _, _, v = string.find(text, "Increases healing done by magical spells by up to (%d+) for 3600 sec%.")
+                if v then ho = ho + tonumber(v) end
+
+                _, _, v = string.find(text, "Healing increased by up to (%d+)%.")
+                if v then ho = ho + tonumber(v) end
+
+                _, _, v = string.find(text, "Healing spells increased by up to (%d+)%.")
+                if v then ho = ho + tonumber(v) end
+
+                _, _, v = string.find(text, "Increases healing done by magical spells and effects by up to (%d+)%.")
+                if v then ho = ho + tonumber(v) end
+
+                _, _, v = string.find(text, "Healing done is increased by up to (%d+)")
+                if v then ho = ho + tonumber(v) end
+
+                _, _, v = string.find(text, "Healing Bonus increased by (%d+)")
+                if v then ho = ho + tonumber(v) end
+            end
+        end
+    end
+
+    healCache.damage_and_healing = dah
+    healCache.healing_only       = ho
+    healCache.dirty              = false
+
+    Debug(string.format("HealPower scan: dah=%d ho=%d total=%d", dah, ho, dah + ho))
+end
+
+-- Returns total effective healing power (gear + buffs).
+-- Scans lazily: only re-scans when inventory or auras changed.
+local function GetEffectiveHealingPower()
+    if healCache.dirty then
+        ScanHealingPower()
+    end
+    return healCache.damage_and_healing + healCache.healing_only
+end
+
+-- Returns the estimated effective heal of LHW rank (1-6) given current +healing gear.
+local function LHWEffectiveHeal(rank)
+    return LHW_BASE[rank] + GetEffectiveHealingPower() * LHW_HEAL_COEFF
+end
+
+-- Returns effective heal on Chain Heal primary target for a given rank
+local function CHEffectiveHeal()
+    return CH_BASE_R1 + GetEffectiveHealingPower() * CH_HEAL_COEFF
 end
 
 local function TANK_SCORE_FLOOR() return 5 end
@@ -233,67 +433,93 @@ end
 
 -------------------------------------------------------------------------------
 -- LHW Rank Selection
--- Tank-like units: pressure-based (R2 below floor, R6 above)
--- Non-tank:        R2 efficient top-off, R6 only if below 40% hp
--- Mana gates: step down if we can't afford chosen rank
+-- Picks the lowest rank whose effective heal covers the target's need,
+-- then steps down if we can't afford that rank.
+--
+-- "required" = raw HP deficit for non-tanks.
+-- "required" = deficit * TANK_OVERHEAL_FACTOR for tanks, so we land a small
+--              buffer rather than a perfectly fitted heal on someone still
+--              taking hits.
+--
+-- Walk R1..R6: use the first rank where effectiveHeal >= required.
+-- If no rank covers it (target is very low, deficit > R6 effective), use R6.
+-- Mana gate: step down from chosen rank until we can afford it; floor at R1.
 -------------------------------------------------------------------------------
 
 local function PickLHWRank(unit)
-    local maxRank = table.getn(SPELL_ID["Lesser Healing Wave"])
-    local mana    = UnitMana("player")
-    local hp      = GetHP(unit)
+    local missing        = UnitHealthMax(unit) - UnitHealth(unit)
+    local factor         = IsTankLike(unit) and (settings.TANK_OVERHEAL_FACTOR or 1.20) or 1.0
+    local aggressiveness = settings.DOWNRANK_AGGRESSIVENESS or 1.0
+    local required       = missing * factor * aggressiveness
+    local mana           = UnitMana("player")
 
-    local intendedRank
-    if IsTankLike(unit) then
-        local pressure = ComputePressure(unit)
-        if pressure >= settings.LHW_PRESSURE_FLOOR then
-            intendedRank = maxRank   -- R6 fast throughput
-        else
-            intendedRank = 2         -- R2 efficient top-off
-        end
-    else
-        if hp < 40 then
-            intendedRank = maxRank
-        else
-            intendedRank = 2
+    -- Find the lowest rank that covers the required amount
+    local intendedRank = 6   -- default to max if nothing covers it
+    for rank = 1, 6 do
+        if LHWEffectiveHeal(rank) >= required then
+            intendedRank = rank
+            break
         end
     end
 
-    -- Step down if mana is too low, floor at R2 (never cast R1 on purpose)
-    while intendedRank > 2 do
-        local cost = LHW_MANA[intendedRank] or 0
-        if mana >= cost then break end
+    -- Mana gate: step down until affordable, floor at R1
+    while intendedRank > 1 and mana < LHW_MANA[intendedRank] do
         intendedRank = intendedRank - 1
     end
 
-    return intendedRank
+    local effectiveHeal = LHWEffectiveHeal(intendedRank)
+    Debug(string.format("PickLHWRank: %s missing=%d required=%.0f effective=%.0f -> R%d",
+          UnitName(unit) or "?", missing, required, effectiveHeal, intendedRank))
+
+    return intendedRank, required, effectiveHeal
 end
 
 -------------------------------------------------------------------------------
 -- Heal Decision Logging
--- Fields: ts | unit | hp% | pressure | clusterScore | mode | liveAggro |
---         aggroScore | action | spellRank
+-- Fields: ts | unit | hp% | pressure | clusterScore | liveAggro |
+--         aggroScore | action | spellRank | healingPower | missingHP |
+--         required | effectiveHeal
+--
+-- healingPower:    total +healing power at cast time
+-- missingHP:       raw HP deficit of the target at cast time
+-- required:        HP threshold the chosen rank must meet; 0 for Chain Heal
+-- effectiveHeal:   estimated heal of the chosen rank; 0 for Chain Heal
+-- aggressiveness:  DOWNRANK_AGGRESSIVENESS or CRISIS_AGGRESSIVENESS at cast time
+-- isTank:          1 if Banzai flagged target as tank-like, 0 otherwise
+--
+-- action values:
+--   LHW, LHW_CRISIS         normal LHW cast
+--   CHAIN_HEAL               normal Chain Heal cast
 -------------------------------------------------------------------------------
 
 local function LogTimestamp()
-    local t = GetGameTime()
-    local h = math.mod(math.floor(t), 24)
-    local m = math.floor(math.mod(t, 1) * 60)
-    local s = math.floor(math.mod(math.mod(t, 1) * 60, 1) * 60)
-    return string.format("%02d:%02d:%02d", h, m, s)
+    -- GetTime() is high-resolution uptime; GetGameTime() is seconds since midnight.
+    -- Combine them: use GetGameTime() for h/m/s and GetTime() fraction for cs.
+    local gt = math.floor(GetGameTime())
+    local h  = math.mod(math.floor(gt / 3600), 24)
+    local m  = math.floor(math.mod(gt, 3600) / 60)
+    local s  = math.mod(gt, 60)
+    local cs = math.floor(math.mod(GetTime(), 1) * 100)
+    return string.format("%02d:%02d:%02d.%02d", h, m, s, cs)
 end
 
-local function LogAction(unit, pressure, clusterScore, action, spellRank)
+local function LogAction(unit, pressure, clusterScore, action, spellRank, required, effectiveHeal, aggr, isTank)
     if not logBuffer then return end
     local name   = UnitName(unit) or "?"
     local hp     = math.floor(GetHP(unit))
     local live   = liveAggro[name] and "1" or "0"
     local score  = aggroCount[name] or 0
-    local mode   = settings.RAID_MODE and "raid" or "solo"
     local ts     = LogTimestamp()
-    local line   = string.format("%s|%s|%d|%.2f|%.3f|%s|%s|%d|%s|%s",
-        ts, name, hp, pressure, clusterScore, mode,
-        live, score, action, tostring(spellRank))
+
+    local healingPower = GetEffectiveHealingPower()
+    local missingHP    = UnitHealthMax(unit) - UnitHealth(unit)
+
+    local line   = string.format("%s|%s|%d|%.2f|%.3f|%s|%d|%s|%s|%d|%d|%d|%d|%.2f|%s",
+        ts, name, hp, pressure, clusterScore,
+        live, score, action, tostring(spellRank),
+        healingPower, missingHP,
+        math.floor(required or 0), math.floor(effectiveHeal or 0),
+        aggr or 1.0, isTank and "1" or "0")
     if table.getn(logBuffer) >= LOG_MAX_ENTRIES then
         table.remove(logBuffer, 1)
     end
@@ -313,7 +539,7 @@ local function FlushLog()
     local lines = {}
     table.insert(lines, "# Tidecaller session export " .. LogTimestamp() ..
                          " zone=" .. (GetZoneText() or "?"))
-    table.insert(lines, "# ts|unit|hp%|pressure|clusterScore|mode|liveAggro|aggroScore|action|spellRank")
+    table.insert(lines, "# ts(hh:mm:ss.cs)|unit|hp%|pressure|clusterScore|liveAggro|aggroScore|action|spellRank|healingPower|missingHP|required|effectiveHeal|aggressiveness|isTank")
     for _, line in ipairs(logBuffer) do
         table.insert(lines, line)
     end
@@ -378,15 +604,11 @@ end
 -------------------------------------------------------------------------------
 -- Main Healing Logic
 --
--- SOLO MODE:
---   1. If a tank-like unit has high pressure (>= LHW_PRESSURE_FLOOR) → LHW
---   2. If 2+ hurt players are clustered → Chain Heal on best cluster target
---   3. Otherwise LHW on highest pressure unit
---
--- RAID MODE:
---   1. If any tank-like unit has crisis pressure (>= 0.80) and is alone → LHW R6
---   2. Otherwise Chain Heal on best cluster target
---   3. Fall back to LHW if no cluster candidates
+--   1. Tank in crisis (pressure >= 0.80) → LHW rank per CRISIS_AGGRESSIVENESS
+--   2. Tank with enough nearby hurt players (>= CHAIN_HEAL_MIN) → Chain Heal R1
+--   3. Tank isolated or deficit too large → LHW at appropriate rank
+--   4. No tank, cluster exists (>= CHAIN_HEAL_MIN nearby hurt) → Chain Heal R1
+--   5. Fallback → LHW on highest pressure unit
 -------------------------------------------------------------------------------
 
 local function HealMembers()
@@ -428,8 +650,8 @@ local function HealMembers()
 
     -- QuickHeal avoidance: if enabled and top candidate is low pressure,
     -- assume QuickHeal users are already covering them and heal the 2nd
-    -- highest pressure target instead.  High pressure (>= LHW_PRESSURE_FLOOR)
-    -- always overrides — never let a tank die to avoid doubling up.
+    -- highest pressure target instead.  High pressure (>= LHW_PRESSURE_FLOOR
+    -- urgency threshold) always overrides — never let a tank die to avoid doubling up.
     if settings.QUICKHEAL_AVOID
     and topPressure < settings.LHW_PRESSURE_FLOOR
     and table.getn(candidates) >= 2 then
@@ -440,141 +662,77 @@ local function HealMembers()
         topPressure = ComputePressure(topUnit)
     end
 
-    -- ---- SOLO MODE ----
-    -- Prioritises tank survival above all else. If the tank is severely
-    -- pressured (>= 0.80), LHW immediately regardless of cluster opportunity.
-    -- Otherwise same logic as raid mode: Chain Heal when nearby hurt players
-    -- exist, LHW when tank is isolated.
-    if not settings.RAID_MODE then
-        Debug("SOLO MODE: top=" .. (UnitName(topUnit) or "?") ..
-              string.format(" pressure=%.2f", topPressure))
-
-        -- 1. Tank in crisis — LHW immediately, don't waste time on Chain Heal
-        if IsTankLike(topUnit) and topPressure >= 0.80 then
-            local rank = PickLHWRank(topUnit)
-            TargetUnit(topUnit)
-            CastSpellByName("Lesser Healing Wave(Rank " .. rank .. ")")
-            TargetLastTarget()
-            LogAction(topUnit, topPressure, 0, "LHW_CRISIS", rank)
-            Debug(string.format("LHW R%d CRISIS on tank %s (pressure=%.2f)",
-                  rank, UnitName(topUnit) or "?", topPressure))
-            return
-        end
-
-        -- 2. Tank with nearby hurt players — Chain Heal
-        if IsTankLike(topUnit) then
-            local nearbyHurt = NearbyHurtCount(topUnit, candidates)
-            if nearbyHurt > 0 then
-                local clusterScore = ClusterScore(topUnit, candidates)
-                local rank
-                if clusterScore >= 0.60 then rank = 3
-                elseif clusterScore >= 0.30 then rank = 2
-                else rank = 1 end
-                TargetUnit(topUnit)
-                CastSpellByName("Chain Heal(Rank " .. rank .. ")")
-                TargetLastTarget()
-                LogAction(topUnit, topPressure, clusterScore, "CHAIN_HEAL", rank)
-                Debug(string.format("CHAIN HEAL R%d on tank %s (cluster=%.3f nearbyHurt=%d)",
-                      rank, UnitName(topUnit) or "?", clusterScore, nearbyHurt))
-                return
-            else
-                local rank = PickLHWRank(topUnit)
-                TargetUnit(topUnit)
-                CastSpellByName("Lesser Healing Wave(Rank " .. rank .. ")")
-                TargetLastTarget()
-                LogAction(topUnit, topPressure, 0, "LHW", rank)
-                Debug(string.format("LHW R%d on isolated tank %s (pressure=%.2f)",
-                      rank, UnitName(topUnit) or "?", topPressure))
-                return
-            end
-        end
-
-        -- 3. Non-tank: Chain Heal if cluster, otherwise LHW
-        local chainTarget, clusterScore = PickChainHealTarget(candidates)
-        if chainTarget then
-            local nearby = NearbyHurtCount(chainTarget, candidates)
-            if nearby >= (settings.CHAIN_HEAL_MIN - 1) then
-                local rank
-                if clusterScore >= 0.60 then rank = 3
-                elseif clusterScore >= 0.30 then rank = 2
-                else rank = 1 end
-                TargetUnit(chainTarget)
-                CastSpellByName("Chain Heal(Rank " .. rank .. ")")
-                TargetLastTarget()
-                LogAction(chainTarget, topPressure, clusterScore, "CHAIN_HEAL", rank)
-                Debug(string.format("CHAIN HEAL R%d on %s (cluster=%.3f nearby=%d)",
-                      rank, UnitName(chainTarget) or "?", clusterScore, nearby))
-                return
-            end
-        end
-
-        -- 4. Fallback: LHW
-        local rank = PickLHWRank(topUnit)
-        TargetUnit(topUnit)
-        CastSpellByName("Lesser Healing Wave(Rank " .. rank .. ")")
-        TargetLastTarget()
-        LogAction(topUnit, topPressure, 0, "LHW", rank)
-        Debug(string.format("LHW R%d on %s (fallback, pressure=%.2f)",
-              rank, UnitName(topUnit) or "?", topPressure))
-        return
-    end
-
-    -- ---- RAID MODE ----
-    -- Chain Heal primary. LHW only when tank is isolated with no nearby hurt players.
-    Debug("RAID MODE: top=" .. (UnitName(topUnit) or "?") ..
+    Debug("Heal: top=" .. (UnitName(topUnit) or "?") ..
           string.format(" pressure=%.2f", topPressure))
 
-    -- 1. Tank with nearby hurt players — Chain Heal
+    -- 1. Tank in crisis — rank selected by CRISIS_AGGRESSIVENESS, no mana gate
+    if IsTankLike(topUnit) and topPressure >= 0.80 then
+        local missing    = UnitHealthMax(topUnit) - UnitHealth(topUnit)
+        local crisisAggr = settings.CRISIS_AGGRESSIVENESS or 1.0
+        local required   = missing * (settings.TANK_OVERHEAL_FACTOR or 1.20) * crisisAggr
+        local crisisRank = 6
+        for r = 1, 6 do
+            if LHWEffectiveHeal(r) >= required then
+                crisisRank = r
+                break
+            end
+        end
+        local eff = LHWEffectiveHeal(crisisRank)
+        TargetUnit(topUnit)
+        CastSpellByName("Lesser Healing Wave(Rank " .. crisisRank .. ")")
+        TargetLastTarget()
+        LogAction(topUnit, topPressure, 0, "LHW_CRISIS", crisisRank, required, eff, settings.CRISIS_AGGRESSIVENESS or 1.0, true)
+        Debug(string.format("LHW R%d CRISIS on tank %s (pressure=%.2f aggr=%.2f)",
+              crisisRank, UnitName(topUnit) or "?", topPressure, crisisAggr))
+        return
+    end
+
+    -- 2. Tank with nearby hurt players — Chain Heal if enough injured for it
     if IsTankLike(topUnit) then
         local nearbyHurt = NearbyHurtCount(topUnit, candidates)
-        if nearbyHurt > 0 then
+        if nearbyHurt >= (settings.CHAIN_HEAL_MIN - 1) then
             local clusterScore = ClusterScore(topUnit, candidates)
-            local rank
-            if clusterScore >= 0.60 then rank = 3
-            elseif clusterScore >= 0.30 then rank = 2
-            else rank = 1 end
             TargetUnit(topUnit)
-            CastSpellByName("Chain Heal(Rank " .. rank .. ")")
+            CastSpellByName("Chain Heal(Rank 1)")
             TargetLastTarget()
-            LogAction(topUnit, topPressure, clusterScore, "CHAIN_HEAL", rank)
-            Debug(string.format("CHAIN HEAL R%d on tank %s (cluster=%.3f nearbyHurt=%d)",
-                  rank, UnitName(topUnit) or "?", clusterScore, nearbyHurt))
+            LogAction(topUnit, topPressure, clusterScore, "CHAIN_HEAL", 1, 0, CHEffectiveHeal(), settings.DOWNRANK_AGGRESSIVENESS or 1.0, IsTankLike(topUnit))
+            Debug(string.format("CHAIN HEAL R1 on tank %s (cluster=%.3f nearbyHurt=%d)",
+                  UnitName(topUnit) or "?", clusterScore, nearbyHurt))
             return
         else
-            local rank = PickLHWRank(topUnit)
+            local rank, req, eff = PickLHWRank(topUnit)
             TargetUnit(topUnit)
             CastSpellByName("Lesser Healing Wave(Rank " .. rank .. ")")
             TargetLastTarget()
-            LogAction(topUnit, topPressure, 0, "LHW", rank)
-            Debug(string.format("LHW R%d on isolated tank %s (pressure=%.2f)",
+            LogAction(topUnit, topPressure, 0, "LHW", rank, req, eff, settings.DOWNRANK_AGGRESSIVENESS or 1.0, IsTankLike(topUnit))
+            Debug(string.format("LHW R%d on tank %s (pressure=%.2f)",
                   rank, UnitName(topUnit) or "?", topPressure))
             return
         end
     end
 
-    -- 2. Non-tank: Chain Heal on best cluster target
+    -- 3. Non-tank: Chain Heal if enough injured players clustered, otherwise LHW
     local chainTarget, clusterScore = PickChainHealTarget(candidates)
     if chainTarget then
-        local rank
-        if clusterScore >= 0.80 then rank = 3
-        elseif clusterScore >= 0.40 then rank = 2
-        else rank = 1 end
-        TargetUnit(chainTarget)
-        CastSpellByName("Chain Heal(Rank " .. rank .. ")")
-        TargetLastTarget()
-        LogAction(chainTarget, topPressure, clusterScore, "CHAIN_HEAL", rank)
-        Debug(string.format("CHAIN HEAL R%d on %s (cluster=%.3f)",
-              rank, UnitName(chainTarget) or "?", clusterScore))
-        return
+        local nearby = NearbyHurtCount(chainTarget, candidates)
+        if nearby >= (settings.CHAIN_HEAL_MIN - 1) then
+            TargetUnit(chainTarget)
+            CastSpellByName("Chain Heal(Rank 1)")
+            TargetLastTarget()
+            LogAction(chainTarget, topPressure, clusterScore, "CHAIN_HEAL", 1, 0, CHEffectiveHeal(), settings.DOWNRANK_AGGRESSIVENESS or 1.0, IsTankLike(chainTarget))
+            Debug(string.format("CHAIN HEAL R1 on %s (cluster=%.3f nearby=%d)",
+                  UnitName(chainTarget) or "?", clusterScore, nearby))
+            return
+        end
     end
 
-    -- 3. Fallback: LHW
-    local rank = PickLHWRank(topUnit)
+    -- 4. Fallback: LHW
+    local rank, req, eff = PickLHWRank(topUnit)
     TargetUnit(topUnit)
     CastSpellByName("Lesser Healing Wave(Rank " .. rank .. ")")
     TargetLastTarget()
-    LogAction(topUnit, topPressure, 0, "LHW", rank)
-    Debug(string.format("LHW R%d on %s (no chain candidates, pressure=%.2f)",
+    LogAction(topUnit, topPressure, 0, "LHW", rank, req, eff, settings.DOWNRANK_AGGRESSIVENESS or 1.0, IsTankLike(topUnit))
+    Debug(string.format("LHW R%d on %s (fallback, pressure=%.2f)",
           rank, UnitName(topUnit) or "?", topPressure))
 end
 
@@ -615,6 +773,7 @@ end
 eventFrame:SetScript("OnEvent", function()
     if event == "ADDON_LOADED" and arg1 == "Tidecaller" then
         for k, v in pairs(TidecallerDB) do settings[k] = v end
+        BuildDRFrame()
         Print("Loaded. Type /tc for help.")
 
     elseif event == "VARIABLES_LOADED" then
@@ -629,18 +788,94 @@ eventFrame:SetScript("OnEvent", function()
         if logBuffer and table.getn(logBuffer) > 0 then
             FlushLog()
         end
+
     end
 end)
 
+
 -------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-- Downrank GUI — /tcdr to toggle
+-------------------------------------------------------------------------------
+
+local drFrame = nil
+
+local function MakeSlider(parent, name, yOffset, getSetting, setSetting)
+    local lbl = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    lbl:SetPoint("TOPLEFT", parent, "TOPLEFT", 12, yOffset)
+    lbl:SetJustifyH("LEFT")
+    lbl:SetTextColor(1.0, 0.82, 0.0)
+    lbl:SetText(name .. "  " .. string.format("%.2f", getSetting()))
+
+    local s = CreateFrame("Slider", "TidecallerSlider"..name, parent,
+                          "OptionsSliderTemplate")
+    s:SetPoint("TOPLEFT", parent, "TOPLEFT", 12, yOffset - 16)
+    s:SetWidth(180)
+    s:SetHeight(16)
+    s:SetMinMaxValues(0, 1)
+    s:SetValueStep(0.05)
+    s:SetValue(getSetting())
+
+    -- Hide all template sub-elements
+    local lo = _G[s:GetName().."Low"]
+    local hi = _G[s:GetName().."High"]
+    local tx = _G[s:GetName().."Text"]
+    if lo then lo:SetText("") end
+    if hi then hi:SetText("") end
+    if tx then tx:SetText("") end
+
+    s:SetScript("OnValueChanged", function()
+        local v = math.floor(s:GetValue() * 20 + 0.5) / 20
+        setSetting(v)
+        lbl:SetText(name .. "  " .. string.format("%.2f", v))
+    end)
+end
+
+local function BuildDRFrame()
+    local f = CreateFrame("Frame", "TidecallerDRFrame", UIParent)
+    f:SetWidth(210)
+    f:SetHeight(80)
+    f:SetPoint("CENTER", UIParent, "CENTER", 0, 100)
+    f:SetMovable(true)
+    f:EnableMouse(true)
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", function() f:StartMoving() end)
+    f:SetScript("OnDragStop", function() f:StopMovingOrSizing() end)
+    f:SetFrameStrata("DIALOG")
+
+    local bg = f:CreateTexture(nil, "BACKGROUND")
+    bg:SetAllPoints(f)
+    bg:SetTexture(0.06, 0.06, 0.10, 0.85)
+
+    MakeSlider(f, "Normal", -10,
+        function() return settings.DOWNRANK_AGGRESSIVENESS or 1.0 end,
+        function(v)
+            settings.DOWNRANK_AGGRESSIVENESS    = v
+            TidecallerDB.DOWNRANK_AGGRESSIVENESS = v
+        end)
+
+    MakeSlider(f, "Crisis", -46,
+        function() return settings.CRISIS_AGGRESSIVENESS or 1.0 end,
+        function(v)
+            settings.CRISIS_AGGRESSIVENESS    = v
+            TidecallerDB.CRISIS_AGGRESSIVENESS = v
+        end)
+
+    f:Hide()
+    drFrame = f
+    return f
+end
+
 -- Slash Commands
 -------------------------------------------------------------------------------
 
 local function PrintUsage()
     Print("Commands:")
     Print("  /tcheal              - Cast heal decision")
-    Print("  /tcsolo              - Switch to Solo mode (pressure-driven)")
-    Print("  /tcraid              - Switch to Raid mode (Chain Heal primary)")
     Print("  /tcqh                - Toggle QuickHeal avoidance (skip lowest HP target)")
     Print("  /tclog               - Toggle heal decision logging on/off")
     Print("  /tcexport            - Write log buffer to TidecallerLog.txt")
@@ -648,8 +883,10 @@ local function PrintUsage()
     Print("  /tclogstat           - Show log buffer status")
     Print("  /tcfollow            - Toggle follow")
     Print("  /tcl                 - Set follow target to current target")
+    Print("  /tcdr                - Toggle downrank aggressiveness GUI")
     Print("  /tcdebug             - Toggle debug output")
     Print("  /tcbanzai            - Diagnose Banzai integration")
+    Print("  /tcstatus            - Show healing power, effective heals, and rank decisions")
     Print("  /tc                  - Show this help")
 end
 
@@ -657,21 +894,6 @@ end
 SLASH_TCHEAL1 = "/tcheal"
 SlashCmdList["TCHEAL"] = function()
     HealMembers()
-end
-
--- Mode toggles
-SLASH_TCSOLO1 = "/tcsolo"
-SlashCmdList["TCSOLO"] = function()
-    settings.RAID_MODE    = false
-    TidecallerDB.RAID_MODE = false
-    Print("Solo mode ON — pressure-driven LHW primary.")
-end
-
-SLASH_TCRAID1 = "/tcraid"
-SlashCmdList["TCRAID"] = function()
-    settings.RAID_MODE    = true
-    TidecallerDB.RAID_MODE = true
-    Print("Raid mode ON — Chain Heal primary.")
 end
 
 SLASH_TCQH1 = "/tcqh"
@@ -763,6 +985,17 @@ SlashCmdList["TCL"] = function()
     end
 end
 
+-- Downrank GUI
+SLASH_TCDR1 = "/tcdr"
+SlashCmdList["TCDR"] = function()
+    if not drFrame then BuildDRFrame() end
+    if drFrame:IsShown() then
+        drFrame:Hide()
+    else
+        drFrame:Show()
+    end
+end
+
 -- Debug
 SLASH_TCDEBUG1 = "/tcdebug"
 SlashCmdList["TCDEBUG"] = function()
@@ -805,7 +1038,45 @@ SlashCmdList["TCBANZAI"] = function()
     for _ in pairs(aggroCount)  do scoreCount = scoreCount + 1 end
     Print("  liveAggro entries: "  .. liveCount)
     Print("  aggroCount entries: " .. scoreCount)
-    Print("  Mode: " .. (settings.RAID_MODE and "RAID" or "SOLO"))
+end
+
+-- Status / healing power diagnostic
+SLASH_TCSTATUS1 = "/tcstatus"
+SlashCmdList["TCSTATUS"] = function()
+    Print("=== Tidecaller Status ===")
+
+    -- Healing power source check (always uses Tidecaller's own scanner)
+    healCache.dirty = true   -- force a fresh scan for accurate readout
+    local healingPower = GetEffectiveHealingPower()
+    Print("  Healing power source: Tidecaller internal scanner")
+    Print(string.format("  +Damage & healing (gear/buffs): %d", healCache.damage_and_healing))
+    Print(string.format("  +Healing only (gear/buffs):     %d", healCache.healing_only))
+    Print(string.format("  Total healing power:            %d", healingPower))
+
+    -- Effective heal values for all ranks
+    Print(string.format("  Coeff: %.4f    Tank overheal factor: %.2f",
+          LHW_HEAL_COEFF, settings.TANK_OVERHEAL_FACTOR or 1.20))
+    for rank = 1, 6 do
+        Print(string.format("  LHW R%d: base=%d  effective=%.0f",
+              rank, LHW_BASE[rank], LHWEffectiveHeal(rank)))
+    end
+
+    -- Per-member rank decisions
+    Print("  --- Rank decisions (current HP) ---")
+    IterateMembers(function(uid)
+        if not UnitExists(uid) then return end
+        if UnitIsDeadOrGhost(uid) then return end
+        local name    = UnitName(uid) or uid
+        local maxHP   = UnitHealthMax(uid)
+        local missing = maxHP - UnitHealth(uid)
+        local hp      = math.floor(GetHP(uid))
+        local tank    = IsTankLike(uid)
+        local factor  = tank and (settings.TANK_OVERHEAL_FACTOR or 1.20) or 1.0
+        local required = missing * factor
+        local rank = PickLHWRank(uid)
+        Print(string.format("  %s: %d%% hp  missing=%d  required=%.0f  tank=%s  -> LHW R%d",
+              name, hp, missing, required, tank and "yes" or "no", rank))
+    end)
 end
 
 -- Help
