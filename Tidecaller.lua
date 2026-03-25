@@ -22,6 +22,8 @@ TidecallerDB = TidecallerDB or {
     TANK_OVERHEAL_FACTOR = 1.20,   -- Chosen rank must cover this multiple of a tank's deficit
     DOWNRANK_AGGRESSIVENESS = 1.0, -- 0.0-1.0: scales required threshold in PickLHWRank (1.0 = full)
     CRISIS_AGGRESSIVENESS   = 1.0, -- 0.0-1.0: scales required threshold in crisis path (1.0 = full)
+    LHW_RANKS_ENABLED  = { true, true, true, true, true, true }, -- R1-R6
+    CH_RANKS_ENABLED   = { true, false, false },                 -- R1-R3 (R2/R3 off by default)
     QUICKHEAL_AVOID     = false,   -- Skip lowest HP target (assume QuickHeal users cover them)
     FOLLOW_ENABLED      = false,
     FOLLOW_TARGET_NAME  = nil,   -- kept for backward compat; runtime uses FOLLOW_TARGET_UNIT
@@ -135,8 +137,9 @@ local function ScanHealingPower()
     local dah = 0   -- damage and healing
     local ho  = 0   -- healing only
 
-    -- Track which set bonuses we've already counted to avoid adding them
-    -- once per equipped piece (same deduplication BCS uses)
+    -- Track which set bonuses we've already counted.
+    -- Key: setName.."|"..value so each distinct bonus value is counted once
+    -- per set regardless of how many pieces are equipped.
     local countedSets = {}
 
     -- ---- Gear scan ----
@@ -154,8 +157,9 @@ local function ScanHealingPower()
                         local _, _, v
 
                         -- +damage and healing (5 tooltip variants)
+                        -- Guard against matching set bonus lines like "(3) Set: Increases..."
                         _, _, v = string.find(text, "Increases damage and healing done by magical spells and effects by up to (%d+)%.")
-                        if v then dah = dah + tonumber(v) end
+                        if v and not string.find(text, "Set:") then dah = dah + tonumber(v) end
 
                         _, _, v = string.find(text, "Spell Damage %+(%d+)")
                         if v then dah = dah + tonumber(v) end
@@ -170,8 +174,9 @@ local function ScanHealingPower()
                         if v then dah = dah + tonumber(v) end
 
                         -- +healing only (5 tooltip variants)
+                        -- Guard against matching set bonus lines like "(3) Set: Increases..."
                         _, _, v = string.find(text, "Increases healing done by spells and effects by up to (%d+)%.")
-                        if v then ho = ho + tonumber(v) end
+                        if v and not string.find(text, "Set:") then ho = ho + tonumber(v) end
 
                         _, _, v = string.find(text, "Healing Spells %+(%d+)")
                         if v then ho = ho + tonumber(v) end
@@ -190,18 +195,29 @@ local function ScanHealingPower()
                         _, _, v = string.find(text, "^(.+) %(%d/%d%)$")
                         if v then setName = v end
 
-                        -- Set bonuses: only count each set once across all slots
-                        if setName and not countedSets[setName] then
+                        -- Set bonuses: active bonuses start with "Set: ...",
+                        -- inactive ones start with "(N) Set: ..." where N is pieces required.
+                        -- Deduplicate per (setName, type, value) across all equipped pieces.
+                        if setName then
+                            -- Only match lines that start with "Set:" (no leading number)
                             _, _, v = string.find(text, "^Set: Increases damage and healing done by magical spells and effects by up to (%d+)%.")
                             if v then
-                                dah = dah + tonumber(v)
-                                countedSets[setName] = true
+                                local key = setName .. "|dah|" .. v
+                                if not countedSets[key] then
+                                    Debug(string.format("SetBonus DAH +%s from [%s] line: %s", v, setName, string.sub(text,1,40)))
+                                    dah = dah + tonumber(v)
+                                    countedSets[key] = true
+                                end
                             end
 
                             _, _, v = string.find(text, "^Set: Increases healing done by spells and effects by up to (%d+)%.")
                             if v then
-                                ho = ho + tonumber(v)
-                                countedSets[setName] = true
+                                local key = setName .. "|ho|" .. v
+                                if not countedSets[key] then
+                                    Debug(string.format("SetBonus HO +%s from [%s] line: %s", v, setName, string.sub(text,1,40)))
+                                    ho = ho + tonumber(v)
+                                    countedSets[key] = true
+                                end
                             end
                         end
                     end
@@ -293,9 +309,51 @@ local function LHWEffectiveHeal(rank)
     return LHW_BASE[rank] + GetEffectiveHealingPower() * LHW_HEAL_COEFF
 end
 
--- Returns effective heal on Chain Heal primary target for a given rank
-local function CHEffectiveHeal()
-    return CH_BASE_R1 + GetEffectiveHealingPower() * CH_HEAL_COEFF
+-- Returns effective heal on Chain Heal primary target for a given rank (1-3)
+local function CHEffectiveHeal(rank)
+    rank = rank or 1
+    return CH_BASE[rank] + GetEffectiveHealingPower() * CH_HEAL_COEFF
+end
+
+-- Chain Heal base heals for all ranks (used by PickCHRank)
+-- CH_BASE_R1 kept for backward compat, full table defined below
+CH_BASE = { CH_BASE_R1, 449, 606 }
+CH_MANA = { 247, 299, 384 }
+
+-- Returns the best enabled Chain Heal rank for a given deficit.
+-- Picks the lowest enabled rank whose effective heal covers the deficit.
+-- Falls back to highest enabled affordable rank if none covers it.
+-- Returns nil if no CH ranks are enabled.
+local function PickCHRank(missingHP)
+    local enabled = settings.CH_RANKS_ENABLED or { true, false, false }
+    local mana    = UnitMana("player")
+
+    -- Find highest enabled affordable rank as fallback
+    local fallback = nil
+    for r = 3, 1, -1 do
+        if enabled[r] and mana >= CH_MANA[r] then
+            fallback = r
+            break
+        end
+    end
+    if not fallback then
+        -- Check if any rank is enabled at all (even if unaffordable)
+        for r = 1, 3 do
+            if enabled[r] then fallback = r; break end
+        end
+    end
+    if not fallback then return nil end  -- all ranks disabled
+
+    -- Walk R1->R3, pick lowest enabled rank that covers deficit
+    for r = 1, 3 do
+        if enabled[r] and CHEffectiveHeal(r) >= (missingHP or 0) then
+            -- Still respect mana — if unaffordable, step down
+            if mana >= CH_MANA[r] then
+                return r
+            end
+        end
+    end
+    return fallback
 end
 
 local function TANK_SCORE_FLOOR() return 5 end
@@ -453,18 +511,29 @@ local function PickLHWRank(unit)
     local required       = missing * factor * aggressiveness
     local mana           = UnitMana("player")
 
-    -- Find the lowest rank that covers the required amount
-    local intendedRank = 6   -- default to max if nothing covers it
+    -- Find the lowest enabled rank that covers the required amount
+    local enabled = settings.LHW_RANKS_ENABLED or { true, true, true, true, true, true }
+
+    -- Find highest enabled rank as ceiling/fallback
+    local maxEnabled = 1
+    for r = 6, 1, -1 do
+        if enabled[r] then maxEnabled = r; break end
+    end
+
+    local intendedRank = maxEnabled
     for rank = 1, 6 do
-        if LHWEffectiveHeal(rank) >= required then
+        if enabled[rank] and LHWEffectiveHeal(rank) >= required then
             intendedRank = rank
             break
         end
     end
 
-    -- Mana gate: step down until affordable, floor at R1
+    -- Mana gate: step down through enabled ranks until affordable
     while intendedRank > 1 and mana < LHW_MANA[intendedRank] do
         intendedRank = intendedRank - 1
+        while intendedRank > 1 and not enabled[intendedRank] do
+            intendedRank = intendedRank - 1
+        end
     end
 
     local effectiveHeal = LHWEffectiveHeal(intendedRank)
@@ -604,7 +673,7 @@ end
 -------------------------------------------------------------------------------
 -- Main Healing Logic
 --
---   1. Tank in crisis (pressure >= 0.80) → LHW rank per CRISIS_AGGRESSIVENESS
+--   1. Any unit in crisis (pressure >= 0.80) → LHW rank per CRISIS_AGGRESSIVENESS
 --   2. Tank with enough nearby hurt players (>= CHAIN_HEAL_MIN) → Chain Heal R1
 --   3. Tank isolated or deficit too large → LHW at appropriate rank
 --   4. No tank, cluster exists (>= CHAIN_HEAL_MIN nearby hurt) → Chain Heal R1
@@ -665,14 +734,18 @@ local function HealMembers()
     Debug("Heal: top=" .. (UnitName(topUnit) or "?") ..
           string.format(" pressure=%.2f", topPressure))
 
-    -- 1. Tank in crisis — rank selected by CRISIS_AGGRESSIVENESS, no mana gate
-    if IsTankLike(topUnit) and topPressure >= 0.80 then
+    -- 1. Any unit in crisis (pressure >= 0.80) — rank selected by CRISIS_AGGRESSIVENESS, no mana gate
+    if topPressure >= 0.80 then
         local missing    = UnitHealthMax(topUnit) - UnitHealth(topUnit)
         local crisisAggr = settings.CRISIS_AGGRESSIVENESS or 1.0
         local required   = missing * (settings.TANK_OVERHEAL_FACTOR or 1.20) * crisisAggr
+        local crisisEnabled = settings.LHW_RANKS_ENABLED or { true, true, true, true, true, true }
         local crisisRank = 6
+        for r = 6, 1, -1 do
+            if crisisEnabled[r] then crisisRank = r; break end
+        end
         for r = 1, 6 do
-            if LHWEffectiveHeal(r) >= required then
+            if crisisEnabled[r] and LHWEffectiveHeal(r) >= required then
                 crisisRank = r
                 break
             end
@@ -690,14 +763,15 @@ local function HealMembers()
     -- 2. Tank with nearby hurt players — Chain Heal if enough injured for it
     if IsTankLike(topUnit) then
         local nearbyHurt = NearbyHurtCount(topUnit, candidates)
-        if nearbyHurt >= (settings.CHAIN_HEAL_MIN - 1) then
+        local chRank = nearbyHurt >= (settings.CHAIN_HEAL_MIN - 1) and PickCHRank(UnitHealthMax(topUnit) - UnitHealth(topUnit)) or nil
+        if chRank then
             local clusterScore = ClusterScore(topUnit, candidates)
             TargetUnit(topUnit)
-            CastSpellByName("Chain Heal(Rank 1)")
+            CastSpellByName("Chain Heal(Rank " .. chRank .. ")")
             TargetLastTarget()
-            LogAction(topUnit, topPressure, clusterScore, "CHAIN_HEAL", 1, 0, CHEffectiveHeal(), settings.DOWNRANK_AGGRESSIVENESS or 1.0, IsTankLike(topUnit))
-            Debug(string.format("CHAIN HEAL R1 on tank %s (cluster=%.3f nearbyHurt=%d)",
-                  UnitName(topUnit) or "?", clusterScore, nearbyHurt))
+            LogAction(topUnit, topPressure, clusterScore, "CHAIN_HEAL", chRank, 0, CHEffectiveHeal(chRank), settings.DOWNRANK_AGGRESSIVENESS or 1.0, IsTankLike(topUnit))
+            Debug(string.format("CHAIN HEAL R%d on tank %s (cluster=%.3f nearbyHurt=%d)",
+                  chRank, UnitName(topUnit) or "?", clusterScore, nearbyHurt))
             return
         else
             local rank, req, eff = PickLHWRank(topUnit)
@@ -715,13 +789,14 @@ local function HealMembers()
     local chainTarget, clusterScore = PickChainHealTarget(candidates)
     if chainTarget then
         local nearby = NearbyHurtCount(chainTarget, candidates)
-        if nearby >= (settings.CHAIN_HEAL_MIN - 1) then
+        local chRank = nearby >= (settings.CHAIN_HEAL_MIN - 1) and PickCHRank(UnitHealthMax(chainTarget) - UnitHealth(chainTarget)) or nil
+        if chRank then
             TargetUnit(chainTarget)
-            CastSpellByName("Chain Heal(Rank 1)")
+            CastSpellByName("Chain Heal(Rank " .. chRank .. ")")
             TargetLastTarget()
-            LogAction(chainTarget, topPressure, clusterScore, "CHAIN_HEAL", 1, 0, CHEffectiveHeal(), settings.DOWNRANK_AGGRESSIVENESS or 1.0, IsTankLike(chainTarget))
-            Debug(string.format("CHAIN HEAL R1 on %s (cluster=%.3f nearby=%d)",
-                  UnitName(chainTarget) or "?", clusterScore, nearby))
+            LogAction(chainTarget, topPressure, clusterScore, "CHAIN_HEAL", chRank, 0, CHEffectiveHeal(chRank), settings.DOWNRANK_AGGRESSIVENESS or 1.0, IsTankLike(chainTarget))
+            Debug(string.format("CHAIN HEAL R%d on %s (cluster=%.3f nearby=%d)",
+                  chRank, UnitName(chainTarget) or "?", clusterScore, nearby))
             return
         end
     end
@@ -774,6 +849,15 @@ eventFrame:SetScript("OnEvent", function()
     if event == "ADDON_LOADED" and arg1 == "Tidecaller" then
         for k, v in pairs(TidecallerDB) do settings[k] = v end
         BuildDRFrame()
+        -- Backfill sub-tables that may be missing from older saved variables
+        if not TidecallerDB.LHW_RANKS_ENABLED then
+            TidecallerDB.LHW_RANKS_ENABLED = { true, true, true, true, true, true }
+        end
+        if not TidecallerDB.CH_RANKS_ENABLED then
+            TidecallerDB.CH_RANKS_ENABLED = { true, false, false }
+        end
+        settings.LHW_RANKS_ENABLED = TidecallerDB.LHW_RANKS_ENABLED
+        settings.CH_RANKS_ENABLED  = TidecallerDB.CH_RANKS_ENABLED
         Print("Loaded. Type /tc for help.")
 
     elseif event == "VARIABLES_LOADED" then
@@ -784,7 +868,8 @@ eventFrame:SetScript("OnEvent", function()
 
     elseif event == "PLAYER_REGEN_ENABLED" then
         inCombat = false
-        for k in pairs(liveAggro) do liveAggro[k] = nil end
+        for k in pairs(liveAggro)   do liveAggro[k]   = nil end
+        for k in pairs(aggroCount)  do aggroCount[k]  = nil end
         if logBuffer and table.getn(logBuffer) > 0 then
             FlushLog()
         end
@@ -793,6 +878,7 @@ eventFrame:SetScript("OnEvent", function()
 end)
 
 
+-------------------------------------------------------------------------------
 -------------------------------------------------------------------------------
 -------------------------------------------------------------------------------
 -------------------------------------------------------------------------------
@@ -820,7 +906,6 @@ local function MakeSlider(parent, name, yOffset, getSetting, setSetting)
     s:SetValueStep(0.05)
     s:SetValue(getSetting())
 
-    -- Hide all template sub-elements
     local lo = _G[s:GetName().."Low"]
     local hi = _G[s:GetName().."High"]
     local tx = _G[s:GetName().."Text"]
@@ -835,10 +920,29 @@ local function MakeSlider(parent, name, yOffset, getSetting, setSetting)
     end)
 end
 
+local function MakeCheckbox(parent, label, x, y, getSetting, setSetting)
+    local cb = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+    cb:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+    cb:SetWidth(20)
+    cb:SetHeight(20)
+    cb:SetChecked(getSetting())
+
+    local lbl = cb:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    lbl:SetPoint("RIGHT", cb, "LEFT", -2, 0)
+    lbl:SetText(label)
+    lbl:SetTextColor(0.8, 0.8, 0.8)
+    lbl:SetJustifyH("RIGHT")
+
+    cb:SetScript("OnClick", function()
+        setSetting(cb:GetChecked() == 1)
+    end)
+    return cb
+end
+
 local function BuildDRFrame()
     local f = CreateFrame("Frame", "TidecallerDRFrame", UIParent)
-    f:SetWidth(210)
-    f:SetHeight(80)
+    f:SetWidth(220)
+    f:SetHeight(230)
     f:SetPoint("CENTER", UIParent, "CENTER", 0, 100)
     f:SetMovable(true)
     f:EnableMouse(true)
@@ -851,6 +955,7 @@ local function BuildDRFrame()
     bg:SetAllPoints(f)
     bg:SetTexture(0.06, 0.06, 0.10, 0.85)
 
+    -- Sliders
     MakeSlider(f, "Normal", -10,
         function() return settings.DOWNRANK_AGGRESSIVENESS or 1.0 end,
         function(v)
@@ -864,6 +969,74 @@ local function BuildDRFrame()
             settings.CRISIS_AGGRESSIVENESS    = v
             TidecallerDB.CRISIS_AGGRESSIVENESS = v
         end)
+
+    -- Divider
+    local div = f:CreateTexture(nil, "OVERLAY")
+    div:SetPoint("TOPLEFT",  f, "TOPLEFT",  8, -92)
+    div:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, -92)
+    div:SetHeight(1)
+    div:SetTexture(0.3, 0.3, 0.3, 0.8)
+
+    -- LHW rank checkboxes — 2 rows of 3
+    local lhwLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    lhwLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -98)
+    lhwLabel:SetText("LHW")
+    lhwLabel:SetTextColor(1.0, 0.82, 0.0)
+
+    local lhwRows = { {1,2,3}, {4,5,6} }
+    for row, ranks in ipairs(lhwRows) do
+        local yOff = -112 - (row - 1) * 26
+        local cbX  = 30
+        for _, r in ipairs(ranks) do
+            local rank = r
+            MakeCheckbox(f, "R"..r, cbX, yOff,
+                function() return (settings.LHW_RANKS_ENABLED or {})[rank] ~= false end,
+                function(v)
+                    if not settings.LHW_RANKS_ENABLED then
+                        settings.LHW_RANKS_ENABLED = { true, true, true, true, true, true }
+                    end
+                    if not TidecallerDB.LHW_RANKS_ENABLED then
+                        TidecallerDB.LHW_RANKS_ENABLED = { true, true, true, true, true, true }
+                    end
+                    settings.LHW_RANKS_ENABLED[rank]    = v
+                    TidecallerDB.LHW_RANKS_ENABLED[rank] = v
+                end)
+            cbX = cbX + 60
+        end
+    end
+
+    -- Divider
+    local div2 = f:CreateTexture(nil, "OVERLAY")
+    div2:SetPoint("TOPLEFT",  f, "TOPLEFT",  8, -168)
+    div2:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, -168)
+    div2:SetHeight(1)
+    div2:SetTexture(0.3, 0.3, 0.3, 0.8)
+
+    -- Chain Heal rank checkboxes — single row
+    local chLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    chLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -174)
+    chLabel:SetText("Chain Heal")
+    chLabel:SetTextColor(1.0, 0.82, 0.0)
+
+    local chX = 30
+    for r = 1, 3 do
+        local rank = r
+        MakeCheckbox(f, "CH"..r, chX, -188,
+            function() return (settings.CH_RANKS_ENABLED or {})[rank] ~= false end,
+            function(v)
+                if not settings.CH_RANKS_ENABLED then
+                    settings.CH_RANKS_ENABLED = { true, false, false }
+                end
+                if not TidecallerDB.CH_RANKS_ENABLED then
+                    TidecallerDB.CH_RANKS_ENABLED = { true, false, false }
+                end
+                settings.CH_RANKS_ENABLED[rank]    = v
+                TidecallerDB.CH_RANKS_ENABLED[rank] = v
+            end)
+        chX = chX + 60
+    end
+
+    f:SetHeight(215)
 
     f:Hide()
     drFrame = f
@@ -993,6 +1166,24 @@ SlashCmdList["TCDR"] = function()
         drFrame:Hide()
     else
         drFrame:Show()
+    end
+end
+
+-- Tooltip colour debug — hover an item and run /tctipcolors
+SLASH_TCTIPCOLORS1 = "/tctipcolors"
+SlashCmdList["TCTIPCOLORS"] = function()
+    local tip = TidecallerScanTooltip
+    local link = GetInventoryItemLink("player", 8)  -- head slot, change as needed
+    if not link then Print("No item in head slot"); return end
+    local _, _, eqLink = string.find(link, "(item:%d+:%d+:%d+:%d+)")
+    if not eqLink then return end
+    tip:ClearLines()
+    tip:SetHyperlink(eqLink)
+    for i = 1, tip:NumLines() do
+        local fs = _G["TidecallerScanTooltipTextLeft"..i]
+        local text = fs:GetText() or ""
+        local r, g, b = fs:GetTextColor()
+        Print(string.format("L%d r=%.2f g=%.2f b=%.2f  %s", i, r or 0, g or 0, b or 0, string.sub(text,1,40)))
     end
 end
 
