@@ -22,6 +22,7 @@ TidecallerDB = TidecallerDB or {
     TANK_OVERHEAL_FACTOR = 1.20,   -- Chosen rank must cover this multiple of a tank's deficit
     DOWNRANK_AGGRESSIVENESS = 1.0, -- 0.0-1.0: scales required threshold in PickLHWRank (1.0 = full)
     CRISIS_AGGRESSIVENESS   = 1.0, -- 0.0-1.0: scales required threshold in crisis path (1.0 = full)
+    DEFICIT_WEIGHT          = 1.0, -- 0.5-2.0: how much HP deficit weighs vs aggro in pressure score
     LHW_RANKS_ENABLED  = { true, true, true, true, true, true }, -- R1-R6
     CH_RANKS_ENABLED   = { true, false, false },                 -- R1-R3 (R2/R3 off by default)
     QUICKHEAL_AVOID     = false,   -- Skip lowest HP target (assume QuickHeal users cover them)
@@ -47,6 +48,7 @@ local inCombat       = false
 
 local aggroCount     = {}   -- aggroCount[unitName] = rolling integer
 local liveAggro      = {}   -- liveAggro[unitName]  = true/false
+local losBlacklist   = {}   -- losBlacklist[unitName] = expiry timestamp; unit caused LoS fail
 
 -------------------------------------------------------------------------------
 -- Heal Decision Log
@@ -403,7 +405,12 @@ local function ComputePressure(unit)
 
     local deficit    = GetDeficit(unit)
     local score      = aggroCount[name] or 0
-    local pressure   = deficit * 0.50
+    -- DEFICIT_WEIGHT scales how much raw HP deficit contributes relative to aggro bonuses.
+    -- Default 1.0 = deficit * 0.50, same as before.
+    -- At 2.0, deficit contributes up to 1.0 making it dominant over aggro.
+    -- At 0.5, deficit contributes up to 0.25, making aggro more dominant.
+    local dw         = settings.DEFICIT_WEIGHT or 1.0
+    local pressure   = deficit * 0.50 * dw
 
     if liveAggro[name] then
         pressure = pressure + 0.25
@@ -685,10 +692,19 @@ local function HealMembers()
     local candidates = {}
     local allValid   = {}   -- all valid members regardless of HP
 
+    local now = GetTime()
     IterateMembers(function(unit)
         if not UnitExists(unit) then return end
         if UnitIsDeadOrGhost(unit) then return end
         if not UnitIsConnected(unit) then return end
+        -- UnitIsVisible returns false when out of range or behind terrain (QuickHeal approach)
+        if unit ~= "player" and not UnitIsVisible(unit) then return end
+        -- LoS blacklist: skip units that recently caused a spell failure
+        local uName = UnitName(unit)
+        if uName and losBlacklist[uName] and now < losBlacklist[uName] then
+            Debug("LoS blacklist: skipping " .. uName)
+            return
+        end
         local hp = GetHP(unit)
         table.insert(allValid, unit)
         if hp < settings.HEAL_THRESHOLD then
@@ -822,6 +838,7 @@ eventFrame:RegisterEvent("PLAYER_ALIVE")
 eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
 eventFrame:RegisterEvent("LEARNED_SPELL_IN_TAB")
+eventFrame:RegisterEvent("UI_ERROR_MESSAGE")
 
 local function InitBanzai()
     if TidecallerEvents then return end
@@ -870,14 +887,27 @@ eventFrame:SetScript("OnEvent", function()
         inCombat = false
         for k in pairs(liveAggro)   do liveAggro[k]   = nil end
         for k in pairs(aggroCount)  do aggroCount[k]  = nil end
+        for k in pairs(losBlacklist) do losBlacklist[k] = nil end  -- clear on combat end
         if logBuffer and table.getn(logBuffer) > 0 then
             FlushLog()
+        end
+
+    elseif event == "UI_ERROR_MESSAGE" then
+        -- Use Blizzard locale-independent constants (same approach as QuickHeal)
+        if arg1 and (arg1 == ERR_SPELL_OUT_OF_RANGE or arg1 == SPELL_FAILED_LINE_OF_SIGHT) then
+            local targetName = UnitName("target")
+            if targetName then
+                losBlacklist[targetName] = GetTime() + 1
+                Debug(string.format("Spell blocked (%s): blacklisting %s for 1s", arg1, targetName))
+            end
+            HealMembers()
         end
 
     end
 end)
 
 
+-------------------------------------------------------------------------------
 -------------------------------------------------------------------------------
 -------------------------------------------------------------------------------
 -------------------------------------------------------------------------------
@@ -900,17 +930,17 @@ local function MakeSlider(parent, name, yOffset, getSetting, setSetting)
     local s = CreateFrame("Slider", "TidecallerSlider"..name, parent,
                           "OptionsSliderTemplate")
     s:SetPoint("TOPLEFT", parent, "TOPLEFT", 12, yOffset - 16)
-    s:SetWidth(180)
+    s:SetWidth(200)
     s:SetHeight(16)
-    s:SetMinMaxValues(0, 1)
+    s:SetMinMaxValues(0, 2)
     s:SetValueStep(0.05)
     s:SetValue(getSetting())
 
     local lo = _G[s:GetName().."Low"]
     local hi = _G[s:GetName().."High"]
     local tx = _G[s:GetName().."Text"]
-    if lo then lo:SetText("") end
-    if hi then hi:SetText("") end
+    if lo then lo:SetText("0.0") end
+    if hi then hi:SetText("2.0") end
     if tx then tx:SetText("") end
 
     s:SetScript("OnValueChanged", function()
@@ -920,29 +950,40 @@ local function MakeSlider(parent, name, yOffset, getSetting, setSetting)
     end)
 end
 
-local function MakeCheckbox(parent, label, x, y, getSetting, setSetting)
-    local cb = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
-    cb:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
-    cb:SetWidth(20)
-    cb:SetHeight(20)
-    cb:SetChecked(getSetting())
+local function MakeNormalCrisisSlider(parent, name, yOffset, getSetting, setSetting)
+    local lbl = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    lbl:SetPoint("TOPLEFT", parent, "TOPLEFT", 12, yOffset)
+    lbl:SetJustifyH("LEFT")
+    lbl:SetTextColor(1.0, 0.82, 0.0)
+    lbl:SetText(name .. "  " .. string.format("%.2f", getSetting()))
 
-    local lbl = cb:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    lbl:SetPoint("RIGHT", cb, "LEFT", -2, 0)
-    lbl:SetText(label)
-    lbl:SetTextColor(0.8, 0.8, 0.8)
-    lbl:SetJustifyH("RIGHT")
+    local s = CreateFrame("Slider", "TidecallerSlider"..name, parent,
+                          "OptionsSliderTemplate")
+    s:SetPoint("TOPLEFT", parent, "TOPLEFT", 12, yOffset - 16)
+    s:SetWidth(200)
+    s:SetHeight(16)
+    s:SetMinMaxValues(0, 1)
+    s:SetValueStep(0.05)
+    s:SetValue(getSetting())
 
-    cb:SetScript("OnClick", function()
-        setSetting(cb:GetChecked() == 1)
+    local lo = _G[s:GetName().."Low"]
+    local hi = _G[s:GetName().."High"]
+    local tx = _G[s:GetName().."Text"]
+    if lo then lo:SetText("0.0") end
+    if hi then hi:SetText("1.0") end
+    if tx then tx:SetText("") end
+
+    s:SetScript("OnValueChanged", function()
+        local v = math.floor(s:GetValue() * 20 + 0.5) / 20
+        setSetting(v)
+        lbl:SetText(name .. "  " .. string.format("%.2f", v))
     end)
-    return cb
 end
 
 local function BuildDRFrame()
     local f = CreateFrame("Frame", "TidecallerDRFrame", UIParent)
-    f:SetWidth(220)
-    f:SetHeight(230)
+    f:SetWidth(244)
+    f:SetHeight(165)
     f:SetPoint("CENTER", UIParent, "CENTER", 0, 100)
     f:SetMovable(true)
     f:EnableMouse(true)
@@ -955,37 +996,59 @@ local function BuildDRFrame()
     bg:SetAllPoints(f)
     bg:SetTexture(0.06, 0.06, 0.10, 0.85)
 
-    -- Sliders
-    MakeSlider(f, "Normal", -10,
+    MakeNormalCrisisSlider(f, "Normal", -10,
         function() return settings.DOWNRANK_AGGRESSIVENESS or 1.0 end,
         function(v)
             settings.DOWNRANK_AGGRESSIVENESS    = v
             TidecallerDB.DOWNRANK_AGGRESSIVENESS = v
         end)
 
-    MakeSlider(f, "Crisis", -46,
+    MakeNormalCrisisSlider(f, "Crisis", -46,
         function() return settings.CRISIS_AGGRESSIVENESS or 1.0 end,
         function(v)
             settings.CRISIS_AGGRESSIVENESS    = v
             TidecallerDB.CRISIS_AGGRESSIVENESS = v
         end)
 
+    MakeSlider(f, "DeficitWt", -82,
+        function() return settings.DEFICIT_WEIGHT or 1.0 end,
+        function(v)
+            settings.DEFICIT_WEIGHT    = v
+            TidecallerDB.DEFICIT_WEIGHT = v
+        end)
+
     -- Divider
-    local div = f:CreateTexture(nil, "OVERLAY")
-    div:SetPoint("TOPLEFT",  f, "TOPLEFT",  8, -92)
-    div:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, -92)
-    div:SetHeight(1)
-    div:SetTexture(0.3, 0.3, 0.3, 0.8)
+    local div1 = f:CreateTexture(nil, "OVERLAY")
+    div1:SetPoint("TOPLEFT",  f, "TOPLEFT",  8, -118)
+    div1:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, -118)
+    div1:SetHeight(1)
+    div1:SetTexture(0.3, 0.3, 0.3, 0.8)
 
     -- LHW rank checkboxes — 2 rows of 3
     local lhwLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    lhwLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -98)
+    lhwLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -124)
     lhwLabel:SetText("LHW")
     lhwLabel:SetTextColor(1.0, 0.82, 0.0)
 
+    local function MakeCheckbox(parent, label, x, y, getSetting, setSetting)
+        local cb = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+        cb:SetPoint("TOPLEFT", parent, "TOPLEFT", x, y)
+        cb:SetWidth(20)
+        cb:SetHeight(20)
+        cb:SetChecked(getSetting())
+        local lbl = cb:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        lbl:SetPoint("RIGHT", cb, "LEFT", -2, 0)
+        lbl:SetText(label)
+        lbl:SetTextColor(0.8, 0.8, 0.8)
+        lbl:SetJustifyH("RIGHT")
+        cb:SetScript("OnClick", function()
+            setSetting(cb:GetChecked() == 1)
+        end)
+    end
+
     local lhwRows = { {1,2,3}, {4,5,6} }
     for row, ranks in ipairs(lhwRows) do
-        local yOff = -112 - (row - 1) * 26
+        local yOff = -138 - (row - 1) * 26
         local cbX  = 30
         for _, r in ipairs(ranks) do
             local rank = r
@@ -1007,21 +1070,21 @@ local function BuildDRFrame()
 
     -- Divider
     local div2 = f:CreateTexture(nil, "OVERLAY")
-    div2:SetPoint("TOPLEFT",  f, "TOPLEFT",  8, -168)
-    div2:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, -168)
+    div2:SetPoint("TOPLEFT",  f, "TOPLEFT",  8, -194)
+    div2:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, -194)
     div2:SetHeight(1)
     div2:SetTexture(0.3, 0.3, 0.3, 0.8)
 
-    -- Chain Heal rank checkboxes — single row
+    -- Chain Heal rank checkboxes
     local chLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    chLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -174)
+    chLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 14, -200)
     chLabel:SetText("Chain Heal")
     chLabel:SetTextColor(1.0, 0.82, 0.0)
 
     local chX = 30
     for r = 1, 3 do
         local rank = r
-        MakeCheckbox(f, "CH"..r, chX, -188,
+        MakeCheckbox(f, "CH"..r, chX, -214,
             function() return (settings.CH_RANKS_ENABLED or {})[rank] ~= false end,
             function(v)
                 if not settings.CH_RANKS_ENABLED then
@@ -1036,7 +1099,7 @@ local function BuildDRFrame()
         chX = chX + 60
     end
 
-    f:SetHeight(215)
+    f:SetHeight(245)
 
     f:Hide()
     drFrame = f
@@ -1056,7 +1119,7 @@ local function PrintUsage()
     Print("  /tclogstat           - Show log buffer status")
     Print("  /tcfollow            - Toggle follow")
     Print("  /tcl                 - Set follow target to current target")
-    Print("  /tcdr                - Toggle downrank aggressiveness GUI")
+    Print("  /tcdr                - Toggle downrank / deficit weight GUI")
     Print("  /tcdebug             - Toggle debug output")
     Print("  /tcbanzai            - Diagnose Banzai integration")
     Print("  /tcstatus            - Show healing power, effective heals, and rank decisions")
