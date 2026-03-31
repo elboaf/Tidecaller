@@ -2,7 +2,7 @@
 ## Title: Tidecaller
 ## Notes: Shaman healing with Banzai aggro integration, position-aware Chain Heal targeting, and pressure-based LHW downranking.
 ## Author: Rel
-## Version: 0.2
+## Version: 0.3
 ## SavedVariables: TidecallerDB
 libs\AceLibrary\AceLibrary.lua
 libs\AceEvent-2.0\AceEvent-2.0.lua
