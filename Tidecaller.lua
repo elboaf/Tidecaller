@@ -49,6 +49,7 @@ local inCombat       = false
 local aggroCount     = {}   -- aggroCount[unitName] = rolling integer
 local liveAggro      = {}   -- liveAggro[unitName]  = true/false
 local losBlacklist   = {}   -- losBlacklist[unitName] = expiry timestamp; unit caused LoS fail
+local lastHealTarget = nil  -- name of unit targeted just before each cast (for UI_ERROR_MESSAGE)
 
 -------------------------------------------------------------------------------
 -- Heal Decision Log
@@ -364,6 +365,12 @@ local function IsTankLike(unit)
     local name = UnitName(unit)
     if not name then return false end
     return liveAggro[name] or (aggroCount[name] or 0) >= TANK_SCORE_FLOOR()
+end
+
+-- Target a unit and record their name for UI_ERROR_MESSAGE blacklisting
+local function TargetAndRecord(unit)
+    lastHealTarget = UnitName(unit)
+    TargetUnit(unit)
 end
 
 -- Returns hp% 0-100
@@ -692,13 +699,23 @@ local function HealMembers()
     local candidates = {}
     local allValid   = {}   -- all valid members regardless of HP
 
+    local HEAL_RANGE = 40
     local now = GetTime()
     IterateMembers(function(unit)
         if not UnitExists(unit) then return end
         if UnitIsDeadOrGhost(unit) then return end
         if not UnitIsConnected(unit) then return end
-        -- UnitIsVisible returns false when out of range or behind terrain (QuickHeal approach)
-        if unit ~= "player" and not UnitIsVisible(unit) then return end
+        -- UnitIsVisible: false when out of range or not rendered (LoS/terrain)
+        if unit ~= "player" and UnitIsVisible(unit) ~= 1 then return end
+        -- UnitPosition secondary range check: 40yd hard cap
+        if unit ~= "player" then
+            local px, py = UnitPosition("player")
+            local ux, uy = UnitPosition(unit)
+            if px and ux then
+                local dx, dy = px - ux, py - uy
+                if math.sqrt(dx*dx + dy*dy) > HEAL_RANGE then return end
+            end
+        end
         -- LoS blacklist: skip units that recently caused a spell failure
         local uName = UnitName(unit)
         if uName and losBlacklist[uName] and now < losBlacklist[uName] then
@@ -767,7 +784,7 @@ local function HealMembers()
             end
         end
         local eff = LHWEffectiveHeal(crisisRank)
-        TargetUnit(topUnit)
+        TargetAndRecord(topUnit)
         CastSpellByName("Lesser Healing Wave(Rank " .. crisisRank .. ")")
         TargetLastTarget()
         LogAction(topUnit, topPressure, 0, "LHW_CRISIS", crisisRank, required, eff, settings.CRISIS_AGGRESSIVENESS or 1.0, true)
@@ -782,7 +799,7 @@ local function HealMembers()
         local chRank = nearbyHurt >= (settings.CHAIN_HEAL_MIN - 1) and PickCHRank(UnitHealthMax(topUnit) - UnitHealth(topUnit)) or nil
         if chRank then
             local clusterScore = ClusterScore(topUnit, candidates)
-            TargetUnit(topUnit)
+            TargetAndRecord(topUnit)
             CastSpellByName("Chain Heal(Rank " .. chRank .. ")")
             TargetLastTarget()
             LogAction(topUnit, topPressure, clusterScore, "CHAIN_HEAL", chRank, 0, CHEffectiveHeal(chRank), settings.DOWNRANK_AGGRESSIVENESS or 1.0, IsTankLike(topUnit))
@@ -791,7 +808,7 @@ local function HealMembers()
             return
         else
             local rank, req, eff = PickLHWRank(topUnit)
-            TargetUnit(topUnit)
+            TargetAndRecord(topUnit)
             CastSpellByName("Lesser Healing Wave(Rank " .. rank .. ")")
             TargetLastTarget()
             LogAction(topUnit, topPressure, 0, "LHW", rank, req, eff, settings.DOWNRANK_AGGRESSIVENESS or 1.0, IsTankLike(topUnit))
@@ -807,7 +824,7 @@ local function HealMembers()
         local nearby = NearbyHurtCount(chainTarget, candidates)
         local chRank = nearby >= (settings.CHAIN_HEAL_MIN - 1) and PickCHRank(UnitHealthMax(chainTarget) - UnitHealth(chainTarget)) or nil
         if chRank then
-            TargetUnit(chainTarget)
+            TargetAndRecord(chainTarget)
             CastSpellByName("Chain Heal(Rank " .. chRank .. ")")
             TargetLastTarget()
             LogAction(chainTarget, topPressure, clusterScore, "CHAIN_HEAL", chRank, 0, CHEffectiveHeal(chRank), settings.DOWNRANK_AGGRESSIVENESS or 1.0, IsTankLike(chainTarget))
@@ -819,7 +836,7 @@ local function HealMembers()
 
     -- 4. Fallback: LHW
     local rank, req, eff = PickLHWRank(topUnit)
-    TargetUnit(topUnit)
+    TargetAndRecord(topUnit)
     CastSpellByName("Lesser Healing Wave(Rank " .. rank .. ")")
     TargetLastTarget()
     LogAction(topUnit, topPressure, 0, "LHW", rank, req, eff, settings.DOWNRANK_AGGRESSIVENESS or 1.0, IsTankLike(topUnit))
@@ -888,18 +905,21 @@ eventFrame:SetScript("OnEvent", function()
         for k in pairs(liveAggro)   do liveAggro[k]   = nil end
         for k in pairs(aggroCount)  do aggroCount[k]  = nil end
         for k in pairs(losBlacklist) do losBlacklist[k] = nil end  -- clear on combat end
+        lastHealTarget = nil
         if logBuffer and table.getn(logBuffer) > 0 then
             FlushLog()
         end
 
     elseif event == "UI_ERROR_MESSAGE" then
         -- Use Blizzard locale-independent constants (same approach as QuickHeal)
-        if arg1 and (arg1 == ERR_SPELL_OUT_OF_RANGE or arg1 == SPELL_FAILED_LINE_OF_SIGHT) then
-            local targetName = UnitName("target")
-            if targetName then
-                losBlacklist[targetName] = GetTime() + 1
-                Debug(string.format("Spell blocked (%s): blacklisting %s for 1s", arg1, targetName))
-            end
+        if arg1 and lastHealTarget and
+        (arg1 == ERR_SPELL_OUT_OF_RANGE or arg1 == SPELL_FAILED_LINE_OF_SIGHT) then
+            local isRange = (arg1 == ERR_SPELL_OUT_OF_RANGE)
+            local duration = isRange and 5 or 2  -- range: 5s, LoS: 2s (transient)
+            losBlacklist[lastHealTarget] = GetTime() + duration
+            Debug(string.format("Spell blocked (%s): blacklisting %s for %ds",
+                  arg1, lastHealTarget, duration))
+            lastHealTarget = nil
             HealMembers()
         end
 
